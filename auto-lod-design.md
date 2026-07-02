@@ -171,6 +171,144 @@ function computeLodParams(octree, config) {
 }
 ```
 
+### C++ 实现
+
+```cpp
+#include <cmath>
+#include <cstdint>
+#include <algorithm>
+#include <limits>
+
+struct AutoLodConfig {
+    double targetSplatCount    = 1'000'000.0;
+    double densityCalibration  = 2.0;
+    double minBaseDistance     = 1.0;
+    double maxBaseDistance     = 200.0;
+    double minMultiplier       = 2.0;
+    double maxMultiplier       = 5.0;
+};
+
+struct LodNodeLod {
+    int32_t fileIndex;
+    int64_t offset;
+    int64_t count;
+};
+
+struct LodNode {
+    LodNodeLod lods[8];   // 最多支持 8 级 LOD，lods[0] 为最精细层
+    int32_t    lodCount;  // 实际有效 LOD 级数
+};
+
+struct AutoLodResult {
+    double lodBaseDistance;
+    double lodMultiplier;
+
+    // 统计信息，辅助调试
+    int64_t totalSplatCount;
+    double  sceneDiameter;
+    int32_t lodLevels;
+    bool    baseClamped;
+    bool    multiplierClamped;
+};
+
+/**
+ * 根据 octree 节点数据自动计算 LOD 距离参数。
+ *
+ * 公式：
+ *   base       = D × ∛(targetCount / (C × N))
+ *   multiplier = (D / base)^(1 / (lodLevels - 1))
+ *
+ * @param nodes     octree 叶节点数组
+ * @param nodeCount 节点数量
+ * @param bounds    节点 AABB 紧凑数组，长度 nodeCount * 6
+ *                  每节点 6 个浮点数：[minX minY minZ maxX maxY maxZ]
+ * @param lodLevels octree 实际 LOD 级数
+ * @param config    自动 LOD 配置
+ */
+AutoLodResult computeLodParams(
+    const LodNode*   nodes,
+    int32_t          nodeCount,
+    const float*     bounds,
+    int32_t          lodLevels,
+    const AutoLodConfig& config)
+{
+    // ── Step 1: 统计 N (LOD 0 splat 总数) 与场景 AABB ──────────────
+    int64_t totalSplatCount = 0;
+
+    float minX = std::numeric_limits<float>::infinity();
+    float minY = std::numeric_limits<float>::infinity();
+    float minZ = std::numeric_limits<float>::infinity();
+    float maxX = -std::numeric_limits<float>::infinity();
+    float maxY = -std::numeric_limits<float>::infinity();
+    float maxZ = -std::numeric_limits<float>::infinity();
+
+    for (int32_t i = 0; i < nodeCount; ++i) {
+        if (nodes[i].lodCount > 0 && nodes[i].lods[0].count > 0) {
+            totalSplatCount += nodes[i].lods[0].count;
+        }
+        const int32_t b = i * 6;
+        if (bounds[b    ] < minX) minX = bounds[b    ];
+        if (bounds[b + 1] < minY) minY = bounds[b + 1];
+        if (bounds[b + 2] < minZ) minZ = bounds[b + 2];
+        if (bounds[b + 3] > maxX) maxX = bounds[b + 3];
+        if (bounds[b + 4] > maxY) maxY = bounds[b + 4];
+        if (bounds[b + 5] > maxZ) maxZ = bounds[b + 5];
+    }
+
+    // 场景 AABB 对角直径
+    const float dx = maxX - minX;
+    const float dy = maxY - minY;
+    const float dz = maxZ - minZ;
+    const double sceneDiameter = std::sqrt(
+        static_cast<double>(dx) * dx +
+        static_cast<double>(dy) * dy +
+        static_cast<double>(dz) * dz);
+
+    // ── Step 2: 公式计算 base ─────────────────────────────────────
+    const double safeN = static_cast<double>(std::max(totalSplatCount, int64_t{1}));
+    const double ratio = config.targetSplatCount / (config.densityCalibration * safeN);
+
+    // base = D × ∛(max(ratio, 1e-6))   ← 数值保护
+    double rawBase = sceneDiameter * std::cbrt(std::max(ratio, 1e-6));
+    double base = std::clamp(rawBase, config.minBaseDistance, config.maxBaseDistance);
+    const bool baseClamped = (base != rawBase);
+
+    // ── Step 3: 公式计算 multiplier ───────────────────────────────
+    const double safeBase = std::max(base, 1e-3);
+    const double span     = sceneDiameter / safeBase;
+    const double levels   = std::max(1.0, static_cast<double>(lodLevels - 1));
+
+    // M = span^(1 / levels)
+    double rawM = std::pow(span, 1.0 / levels);
+    double multiplier = std::clamp(rawM, config.minMultiplier, config.maxMultiplier);
+    const bool multiplierClamped = (multiplier != rawM);
+
+    return {
+        base,
+        multiplier,
+        totalSplatCount,
+        sceneDiameter,
+        lodLevels,
+        baseClamped,
+        multiplierClamped
+    };
+}
+```
+
+**与 JS 实现的对应关系**：
+
+| JS 代码 | C++ 等价 | 说明 |
+|---------|---------|------|
+| `Math.cbrt(x)` | `std::cbrt(x)` | 立方根，C11 起内置 |
+| `Math.pow(a, b)` | `std::pow(a, b)` | 幂运算 |
+| `Math.max(a, b)` | `std::max(a, b)` | - |
+| `Math.sqrt(x)` | `std::sqrt(x)` | - |
+| `Math.min(a, b)` / `Math.max` | `std::clamp(v, lo, hi)` | C++17，等价于 `max(lo, min(hi, v))` |
+| `Infinity` | `std::numeric_limits<float>::infinity()` | 浮点无穷大 |
+| `config.overrideBaseDistance` | （未包含） | C++ 侧通常由上层逻辑处理覆盖参数 |
+
+C++ 实现适合在**离线构建工具**（生成 octree 时预计算并写入 `lod-meta.json`）或 **Native Viewer** 中使用，与运行时 JS 引擎共享同一套公式，保证双端参数一致。
+
 ---
 
 ## 配置类（建议挂在 `GSplatParams`）
