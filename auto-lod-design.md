@@ -575,3 +575,111 @@ else if (error < 0.7 && E > 1) E -= 0.1;
 3. **依赖 `lodLevels` 准确性**：若 octree 级数不足（如只有 2 级），公式给出的 multiplier 上限 clamp 可能导致覆盖不完整——建议配合 `splatBudget` 使用
 4. **base 下限保护**：`minBaseDistance = 1.0`，避免极密集场景把 base 推得太近导致 GPU 瞬间过载
 5. **维度 E 选择不确定**：E=2（航拍）和 E=3（地面）对 base 影响显著（平方根 vs 立方根），若场景同时包含两种视角，需手动配置或使用运行时自适应机制
+
+---
+
+## 模块框图
+
+### 系统上下文图
+
+```mermaid
+graph TD
+    A["<b>GSplatOctree</b><br/>nodes[i].lods[0].count<br/>nodeBoundsMinMax[i×6]<br/>lodLevels"] -->|N · D · L| C
+    B["<b>GSplatAutoLodParams</b><br/>targetSplatCount<br/>densityCalibration C<br/>dimension E<br/>min/max clamp 参数<br/>overrides"] -->|配置| C
+    C["<b>computeLodParams()</b><br/>① 统计 N, D<br/>② base = D × (t/CN)^(1/E)<br/>③ M = (D/base)^(1/(L-1))<br/>④ clamp 保护"] --> D[lodBaseDistance]
+    C --> E[lodMultiplier]
+    D --> F
+    E --> F["<b>evaluateNodeLods()</b><br/>每节点: dist / nodeSize<br/>与 base × M^k 比较<br/>→ LOD 级别选择"]
+    F --> G["GPU 渲染<br/>≈ targetCount splat"]
+```
+
+### 数据流图
+
+```mermaid
+graph LR
+    subgraph octree [GSplatOctree]
+        N1["nodes[i].lods[0].count"]
+        N2["nodeBoundsMinMax[i×6]"]
+        N3["lodLevels L"]
+    end
+
+    subgraph config [GSplatAutoLodParams]
+        C1["targetSplatCount"]
+        C2["densityCalibration C"]
+        C3["dimension E"]
+        C4["clamp 参数"]
+    end
+
+    subgraph compute [computeLodParams]
+        S1["Step 1: 累加 → N\n合并 → AABB → D"]
+        S2["Step 2: base = D×(t/CN)^(1/E)"]
+        S3["Step 3: M = (D/base)^(1/(L-1))"]
+        S4["Step 4: clamp(base, M)"]
+        S1 --> S2 --> S3 --> S4
+    end
+
+    N1 --> S1
+    N2 --> S1
+    N3 --> S3
+    C1 --> S2
+    C2 --> S2
+    C3 --> S2
+    C4 --> S4
+
+    S4 --> R1["lodBaseDistance"]
+    S4 --> R2["lodMultiplier"]
+```
+
+---
+
+## 计算流程图
+
+### 主流程
+
+```mermaid
+flowchart TD
+    Start([场景加载 / octree 首次就绪]) --> EnableCheck{autoLod.enabled?}
+    EnableCheck --否--> DefaultValues["使用默认值\nbase = 10 / M = 3"]
+    EnableCheck --是--> Traverse["遍历 octree.nodes\n累加 lods[0].count → N\n合并 bounds → AABB"]
+    Traverse --> CalcD["D = √(dx² + dy² + dz²)\n场景 AABB 对角直径"]
+    CalcD --> OverrideBase{overrideBaseDistance\n≠ null?}
+    OverrideBase --是--> UseBaseOverride["base = overrideBaseDistance"]
+    OverrideBase --否--> CalcBase["ratio = targetCount / (C × N)\nrawBase = D × ratio^(1/E)\nbase = clamp(rawBase, minBase, maxBase)"]
+    UseBaseOverride --> OverrideM
+    CalcBase --> OverrideM{overrideMultiplier\n≠ null?}
+    OverrideM --是--> UseMOverride["M = overrideMultiplier"]
+    OverrideM --否--> CalcM["span = D / base\nlevels = max(L-1, 1)\nrawM = span^(1/levels)\nM = clamp(rawM, minM, maxM)"]
+    UseMOverride --> Output
+    CalcM --> Output["输出\nlodBaseDistance = base\nlodMultiplier = M\nstats = {N, D, L, E,\nbaseClamped, multiplierClamped}"]
+    Output --> Write["写入 placement 参数\n_autoLodEvaluated = true\n（本次加载不再重算）"]
+```
+
+### per-节点 LOD 选择流程（evaluateNodeLods 参考）
+
+```mermaid
+flowchart TD
+    A([每帧 evaluateNodeLods]) --> B[for each octree node]
+    B --> C["dist = camera 到 node 中心距离\nk = 0"]
+    C --> D{k < lodLevels - 1?}
+    D --否--> H
+    D --是--> E["threshold = nodeSize × base × M^k"]
+    E --> F{dist < threshold?}
+    F --是--> H["渲染 node.lods[k]\nk=0 最精细 / k=L-1 最粗糙"]
+    F --否--> G["k++"]
+    G --> D
+    H --> B
+```
+
+> **关键关系**：`base` 控制 LOD 0→1 的切换距离起点，`M` 控制每级之间的距离放大比，`nodeSize` 使大节点在更远处保持精细 LOD。
+
+---
+
+## 公式速查卡
+
+| 量 | 公式 | E=3（地面） | E=2（航拍） | E=1（线性） |
+|----|------|------------|------------|------------|
+| base | `D × (targetCount / (C×N))^(1/E)` | 立方根 | 平方根 | 直接比 |
+| M | `(D / base)^(1 / (L-1))` | — | — | — |
+| base clamp | `[1.0, 200]` | — | — | — |
+| M clamp | `[2.0, 5.0]` | — | — | — |
+| 触发时机 | octree 首次加载完成（仅一次） | — | — | — |
