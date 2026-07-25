@@ -2,7 +2,8 @@
 LOD V5 最终测试脚本
 """
 import sys
-sys.path.insert(0, r'C:\Source\3DGS\engine')
+import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lod_tile_calculator_v5 import TileLODCalculatorV5
 from pathlib import Path
 
