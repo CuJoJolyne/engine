@@ -90,8 +90,11 @@ class TileLODCalculatorV5:
         self.tile_count = len(self.tiles)
         self.scene_center = np.median(centers, axis=0)
         dists = np.linalg.norm(centers - self.scene_center, axis=1)
-        self.max_tile_distance = float(dists.max())
-        self.total_splats = sum(t[1].get(0, 0) for t in self.tiles)
+        self.max_tile_distance = float(dists.max()) if len(dists) > 0 else 0.0
+        # Fix F: fallback to max available LOD if LOD0 missing
+        self.total_splats = sum(
+            t[1].get(0, t[1].get(min(t[1].keys()), 0)) for t in self.tiles
+        )
 
         # 计算 tile 空间密度（用于自适应 visibility factor）
         x_range = centers[:, 0].max() - centers[:, 0].min()
@@ -117,8 +120,11 @@ class TileLODCalculatorV5:
         # 迭代求解 base
         base = self._solve_base(view_mode)
 
-        # 计算 M
-        M = (self.max_tile_distance / base) ** (1 / (self.lod_levels - 1))
+        # 计算 M（Fix B: 防御 lod_levels==1 除零）
+        if self.lod_levels <= 1:
+            M = 1.5
+        else:
+            M = (self.max_tile_distance / max(base, 0.01)) ** (1 / (self.lod_levels - 1))
         M = np.clip(M, 1.5, 4.0)
 
         distances = [float(base * M**k) for k in range(self.lod_levels)]
@@ -222,7 +228,13 @@ class TileLODCalculatorV5:
         base_lo = 1.0
         # 上界用 max_tile_distance（不是 0.5×），确保室内/小场景可以把所有 tile 压到 LOD0
         # 室外大场景 max_dist > 1000m，上界被 500m 自然截断
-        base_hi = min(self.max_tile_distance, 500.0)
+        # Fix E: 防御 max_tile_distance==0（空场景/全重合）
+        base_hi = max(min(self.max_tile_distance, 500.0), base_lo + 0.1)
+
+        # Fix B: 防御 lod_levels<=1
+        if self.lod_levels <= 1:
+            self._last_iterations = 0
+            return base_hi
 
         # 测试上界
         M_hi = (self.max_tile_distance / base_hi) ** (1 / (self.lod_levels - 1))
