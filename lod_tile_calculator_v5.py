@@ -7,10 +7,15 @@ LOD参数计算器 V5 - Tile Simulation + Visibility Factor
 - V5 直接遍历 tile 分配 LOD（ground truth），再乘 visibility factor
 """
 import json
+import logging
 import numpy as np
 from typing import Dict, Tuple, List, Optional
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from lod_io_safety import safe_load_meta, safe_int_key, safe_count
+
+logger = logging.getLogger("lod_tile_calculator_v5")
 
 
 @dataclass
@@ -39,13 +44,17 @@ class TileLODCalculatorV5:
         - Aerial: 0.25 (FOV=120°, 俯视覆盖更广)
     """
 
-    def __init__(self, lod_dir: str, target_splat_count: int = 1_000_000):
+    def __init__(self, lod_dir: str, target_splat_count: int = 1_000_000,
+                 allowed_base_dir: Optional[str] = None):
         """
         Args:
             lod_dir: LOD数据目录（包含 lod-meta.json）
             target_splat_count: 目标渲染 splat 数
+            allowed_base_dir: 可选，约束 lod-meta.json 真实路径必须在此目录内
+                              （防路径穿越；None = 不限制，本地 CLI 默认）
         """
         self.lod_dir = Path(lod_dir)
+        self.allowed_base_dir = allowed_base_dir
         self.target_count = target_splat_count
         self.target_min = int(target_splat_count * 0.8)
         self.target_max = int(target_splat_count * 1.2)
@@ -58,8 +67,8 @@ class TileLODCalculatorV5:
     def _load_tiles(self):
         """从 lod-meta.json 加载所有叶节点 tile"""
         meta_path = self.lod_dir / 'lod-meta.json'
-        with open(meta_path, 'r') as f:
-            meta = json.load(f)
+        # 安全加载：realpath 解析 + 可选目录约束 + 大小限制
+        meta = safe_load_meta(meta_path, allowed_base_dir=self.allowed_base_dir)
 
         self.lod_levels = meta['lodLevels']
         self.tiles = []  # List[(center, lod_counts)]
@@ -67,23 +76,47 @@ class TileLODCalculatorV5:
         def traverse(node):
             has_children = 'children' in node and node['children']
             lods = node.get('lods', {})
+            # 防 lods 容器本身畸形（非 dict，如 list/str）导致 .items() AttributeError
+            # （砚砚 Finding：原第 4 条"格式异常+类型检查"的容器级近邻）
+            if lods and not isinstance(lods, dict):
+                logger.warning("Malformed 'lods' (not a dict, got %s) in %s, treating as empty",
+                               type(lods).__name__, self.lod_dir)
+                lods = {}
             if not has_children and lods:
                 bound = node['bound']
                 bmin = np.array(bound['min'])
                 bmax = np.array(bound['max'])
                 center = (bmin + bmax) / 2
+                # 安全构建 lod_counts：校验 key 为数字 + count 为非负数值，
+                # 跳过并记录畸形项（防畸形 JSON 导致逻辑错误 / 类型异常）
                 lod_counts = {}
                 for k, v in lods.items():
-                    if isinstance(v, dict) and 'count' in v:
-                        lod_counts[int(k)] = v['count']
-                    elif isinstance(v, (int, float)):
-                        lod_counts[int(k)] = int(v)
-                self.tiles.append((center, lod_counts))
+                    ik = safe_int_key(k)
+                    if ik is None:
+                        logger.warning("Skipping malformed LOD key %r in %s", k, self.lod_dir)
+                        continue
+                    c = safe_count(v)
+                    if c is None:
+                        logger.warning("Skipping malformed LOD count %r (key=%r) in %s",
+                                       v, k, self.lod_dir)
+                        continue
+                    lod_counts[ik] = c
+                # 只保留有有效 LOD 数据的 tile（空 dict 会破坏后续 min(keys) 统计）
+                if lod_counts:
+                    self.tiles.append((center, lod_counts))
             if has_children:
                 for child in node['children']:
                     traverse(child)
 
         traverse(meta['tree'])
+
+        # Fail-fast：全部 tile 被跳过（畸形/无有效 LOD）时明确报错，
+        # 否则 np.median(empty, axis=0) / np.linalg.norm(..., axis=1) 会抛 AxisError（砚砚 Finding 2）
+        if not self.tiles:
+            raise ValueError(
+                f"No valid LOD tiles found in {self.lod_dir} "
+                f"(all tiles skipped due to malformed/missing LOD data)"
+            )
 
         # 计算场景统计
         centers = np.array([t[0] for t in self.tiles])
