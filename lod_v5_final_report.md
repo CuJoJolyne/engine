@@ -395,6 +395,41 @@ class TileLODResult:
 
 ---
 
+## I/O 安全加固（人工检视意见 + 跨猫 review）
+
+> 日期 2026-08-10 | 作者 布偶猫/宪宪 claude-opus-4-8 | Reviewer 缅因猫/砚砚 gpt-5.5
+
+### 新增模块 `lod_io_safety.py`（单一真相源）
+
+| 函数 | 职责 | 防御点 |
+|------|------|--------|
+| `safe_load_meta` | 安全加载 meta | `realpath()` 消解符号链接/`..` + 可选 `allowed_base_dir` 约束 + 100MB 大小上限 + utf-8 显式编码 + 畸形 JSON 转 `ValueError` |
+| `safe_int_key` | LOD key 校验 | 仅纯数字非负；`abc`/`-1`/`1.5`/`1e3`/空串/`bool` 转 `None` |
+| `safe_count` | splat count 提取 | 仅 `int` 与整数值 float（`500.0` 收 / `1.9` 拒，**拒绝静默截断**）；负数/非数字 转 `None` |
+
+`lod_density_loader.py` 与 `lod_tile_calculator_v5.py` 均接入，构造函数新增可选 `allowed_base_dir` 参数。
+
+### 修复的失败模式（红转绿）
+
+| # | 失败模式 | 修复 | 测试 |
+|---|---------|------|------|
+| 1 | 非数字 `count` 导致求和 `TypeError` | loader 用 `safe_count` 规范化 entry | `test_lod_malformed` |
+| 2 | 全 tile 无效导致 `np.median(empty)` `AxisError` | calculator fail-fast `raise ValueError` | `test_lod_malformed` |
+| 3 | 非整数 float `count` 静默截断 | `is_integer()` 校验 | `test_lod_io_safety` |
+| 4 | `lods` 非 dict 导致 `.items()` `AttributeError` | 类型守卫转当空处理（不破坏 children 递归） | `test_lod_malformed` |
+
+**验证门**：`test_lod_io_safety` 29/29 + `test_lod_malformed` 7/7 + `test_v5_final` 12/12（无回归），真实 exit 0。
+
+### 已知边界与刻意不做（防「补锅匠」）
+
+缅因猫 review 指出：`bound` 非 dict / `children` 非 list 仍会抛 `TypeError`/`AttributeError`。**本轮刻意不逐点补**——继续 whack-a-mole 是战术勤劳掩盖战略问题。
+
+**决策**：若未来要声明"对畸形 lod-meta schema 整体健壮"，走**统一 `validate_node_shape()` schema pass**（一次性规范化 `tree/node/bound/children/lods`），而非逐点补。建议放到 **JS 移植期**设计一次做对——Python 原型是标定工具，真正的硬化目标是 JS 渲染管线入口。
+
+**移植期硬约束**（Reviewer 非阻塞观察）：JS/服务化入口**必须显式传入 `allowed_base_dir`**，否则"路径在允许目录内"只是可选能力，不是默认防线。
+
+---
+
 ## 致谢
 
 感谢用户的耐心反馈和数据支持，特别是：

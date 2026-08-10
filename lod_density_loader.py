@@ -2,10 +2,15 @@
 LOD数据加载模块 - 支持gsbox生成的.sog格式
 """
 import json
+import logging
 import numpy as np
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
+
+from lod_io_safety import safe_load_meta, safe_int_key, safe_count
+
+logger = logging.getLogger("lod_density_loader")
 
 
 @dataclass
@@ -32,20 +37,18 @@ class OctreeNode:
 class SOGLODLoader:
     """gsbox .sog格式LOD数据加载器"""
 
-    def __init__(self, lod_dir: str):
+    def __init__(self, lod_dir: str, allowed_base_dir: Optional[str] = None):
         """
         Args:
             lod_dir: LOD数据目录路径（包含lod-meta.json）
+            allowed_base_dir: 可选，约束 lod-meta.json 真实路径必须在此目录内
+                              （防路径穿越；None = 不限制，本地 CLI 默认）
         """
         self.lod_dir = Path(lod_dir)
         self.meta_path = self.lod_dir / 'lod-meta.json'
 
-        if not self.meta_path.exists():
-            raise FileNotFoundError(f"lod-meta.json not found in {lod_dir}")
-
-        # 加载元数据
-        with open(self.meta_path, 'r') as f:
-            self.meta = json.load(f)
+        # 安全加载：realpath 解析 + 可选目录约束 + 大小限制
+        self.meta = safe_load_meta(self.meta_path, allowed_base_dir=allowed_base_dir)
 
         self.lod_levels = self.meta['lodLevels']
         self.filenames = self.meta['filenames']
@@ -94,10 +97,37 @@ class SOGLODLoader:
             has_children = 'children' in node_data and node_data['children']
             lods = node_data.get('lods', {})
 
+            # 防 lods 容器本身畸形（非 dict，如 list/str）导致 .items() AttributeError
+            # （砚砚 Finding：原第 4 条"格式异常+类型检查"的容器级近邻）
+            if lods and not isinstance(lods, dict):
+                logger.warning("Malformed 'lods' (not a dict, got %s) in %s, treating as empty",
+                               type(lods).__name__, self.lod_dir)
+                lods = {}
+
             if not has_children and lods:
                 # 叶节点
-                # 转换lods字典的key为int
-                lods_int = {int(k): v for k, v in lods.items()}
+                # 转换lods字典的key为int + 规范化 count（安全：跳过畸形项，
+                # 不因单个坏 key/count 崩溃；防 count 非数字导致下游求和 TypeError）
+                lods_int = {}
+                for k, v in lods.items():
+                    ik = safe_int_key(k)
+                    if ik is None:
+                        logger.warning("Skipping malformed LOD key %r in %s", k, self.lod_dir)
+                        continue
+                    c = safe_count(v)
+                    if c is None:
+                        logger.warning("Skipping malformed LOD count %r (key=%r) in %s",
+                                       v, k, self.lod_dir)
+                        continue
+                    # 保留原 entry 结构（file/offset 等），但用规范化后的 int count 覆盖
+                    entry = dict(v) if isinstance(v, dict) else {}
+                    entry['count'] = c
+                    lods_int[ik] = entry
+
+                # 只保留有有效 LOD 数据的叶节点（空 dict 会破坏统计）
+                if not lods_int:
+                    logger.warning("Skipping leaf with no valid LOD entries in %s", self.lod_dir)
+                    return
 
                 node = OctreeNode(
                     bound_min=bound_min,
